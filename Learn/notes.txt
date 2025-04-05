@@ -1,0 +1,5 @@
+vehicle control
+self._control = carla.VehicleControl()
+
+self._control.throttle = min(self._control.throttle + 0.01, 1.00)
+
