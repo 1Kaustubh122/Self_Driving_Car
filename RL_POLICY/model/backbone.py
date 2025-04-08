@@ -2,10 +2,6 @@ import torch,pdb
 import torchvision
 import torch.nn.modules
 
-"""
-Credits: https://github.com/cfzd/Ultra-Fast-Lane-Detection-v2/
-"""
-
 class vgg16bn(torch.nn.Module):
     def __init__(self,pretrained = False):
         super(vgg16bn,self).__init__()
@@ -36,8 +32,6 @@ class resnet(torch.nn.Module):
             model = torchvision.models.wide_resnet50_2(pretrained=pretrained)
         elif layers == '101wide':
             model = torchvision.models.wide_resnet101_2(pretrained=pretrained)
-        elif layers == '34fca':
-            model = torch.hub.load('cfzd/FcaNet', 'fca34' ,pretrained=True)
         else:
             raise NotImplementedError
         
