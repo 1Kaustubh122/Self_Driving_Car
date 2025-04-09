@@ -1,120 +1,234 @@
-import zmq
-import time
-import carla
-import pickle
+import gym
+from gym import spaces
 import numpy as np
-import gymnasium as gym
+import pickle
+import zmq
+import carla
+from agents.navigation.global_route_planner import GlobalRoutePlanner
+from stable_baselines3 import PPO
+import random
 
-# === GNSS → CARLA LOCATION ===
+# Define a simple Location class for distance calculations
+class Location:
+    def __init__(self, x, y, z=0.0):
+        self.x = x
+        self.y = y
+        self.z = z
+
+    def distance(self, other):
+        """Compute Euclidean distance to another Location."""
+        return np.sqrt((self.x - other.x)**2 + (self.y - other.y)**2 + (self.z - other.z)**2)
+
+# Convert GNSS (latitude, longitude) to Carla coordinates
 def gnss_to_location(lat, lon):
+    """Convert GNSS coordinates to Carla x, y coordinates."""
     x = -14418.6285 * lat + 111279.5690 * lon - 3.19252014
-    y = -109660.6210 * lat +    4.33686914 * lon + 0.367254638
-    return carla.Location(x=x, y=y, z=0.0)
+    y = -109660.6210 * lat + 4.33686914 * lon + 0.367254638
+    return Location(x, y)
 
-# === GNSS DISTANCE IN SIM SPACE ===
-def gnss_distance(coord1, coord2):
-    loc1 = gnss_to_location(*coord1)
-    loc2 = gnss_to_location(*coord2)
-    return loc1.distance(loc2)
+# Convert quaternion to yaw angle
+def quaternion_to_yaw(q):
+    """Extract yaw angle from quaternion orientation."""
+    w, x, y, z = q["w"], q["x"], q["y"], q["z"]
+    siny_cosp = 2 * (w * z + x * y)
+    cosy_cosp = 1 - 2 * (y**2 + z**2)
+    yaw = np.arctan2(siny_cosp, cosy_cosp)
+    return yaw
 
-# === STUCK DETECTION ===
-def is_stuck(info, prev_info, speed_threshold=0.1, time_threshold=2.0):
-    if prev_info is None:
-        return False
-    t1 = info["timestamp"]
-    t0 = prev_info["timestamp"]
-    if t1 - t0 == 0:
-        return False
-    dx = info["gnss"][0] - prev_info["gnss"][0]
-    dy = info["gnss"][1] - prev_info["gnss"][1]
-    dist = np.sqrt(dx**2 + dy**2)
-    speed = dist / (t1 - t0)
-    return speed < speed_threshold and (t1 - prev_info["timestamp"]) > time_threshold
+# Normalize angle to [-pi, pi]
+def normalize_angle(angle):
+    """Normalize an angle to the range [-pi, pi]."""
+    while angle > np.pi:
+        angle -= 2 * np.pi
+    while angle < -np.pi:
+        angle += 2 * np.pi
+    return angle
 
-# === MAIN GYM ENVIRONMENT ===
+# Choose a random goal coordinate from a file
+def choose_random_coordinate(filename="goal_points.txt"):
+    """Select a random (latitude, longitude) pair from a text file."""
+    with open(filename, "r") as f:
+        lines = f.readlines()
+        lat, lon = random.choice(lines).strip().split(",")
+        return float(lat), float(lon)
+
+# Custom Gym environment for Carla
 class CarlaEnv(gym.Env):
-    def __init__(self, goal_gnss, timeout_sec=60):
+    def __init__(self, port=12345):
         super(CarlaEnv, self).__init__()
         
-        context = zmq.Context()
-        self.socket = context.socket(zmq.REQ)
-        self.socket.connect("tcp://localhost:6501")
+        # Setup ZMQ socket for communication with Carla server
+        self.context = zmq.Context()
+        self.socket = self.context.socket(zmq.REQ)
+        self.socket.connect(f"tcp://localhost:{port}")
+        
+        # Setup Carla client to access the map for route planning
+        self.client = carla.Client("localhost", 2000)
+        self.client.set_timeout(10.0)
+        self.world = self.client.get_world()
+        self.map = self.world.get_map()
+        
+        # Define action space: steering [-1, 1], throttle/brake [-1, 1]
+        self.action_space = spaces.Box(low=-1, high=1, shape=(2,), dtype=np.float32)
+        
+        # Define observation space: [distance_to_waypoint, angle_to_waypoint, speed]
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(3,), dtype=np.float32)
+        
+        # Initialize route and waypoint tracking
+        self.route = None
+        self.wp_index = 0
+        
+        # Variables for speed and reward computation
+        self.previous_location = None
+        self.previous_timestamp = None
+        self.previous_distance = None
+        
+        # Episode step limit
+        self.max_steps = 1000
+        self.step_count = 0
 
-        # Action: [steer, throttle] ∈ [-1,1], [0,1]
-        self.action_space = gym.spaces.Box(low=np.array([-1.0, 0.0]),
-                                           high=np.array([1.0, 1.0]),
-                                           dtype=np.float32)
-        # Observation: 84x84 grayscale
-        self.observation_space = gym.spaces.Box(low=0, high=255, 
-                                                shape=(1, 84, 84), dtype=np.uint8)
+    def reset(self):
+        """Reset the environment and return the initial state."""
+        # Send reset command to the server
+        self.socket.send(pickle.dumps({"command": "reset"}))
+        response = pickle.loads(self.socket.recv())
+        if response["status"] != "reset done":
+            raise RuntimeError("Server reset failed")
 
-        self.prev_info = None
-        self.target_gnss = goal_gnss
-        self.timeout_sec = timeout_sec
-        self.reset_time = time.time()
+        # Send a dummy action to get the initial observation
+        self.socket.send(pickle.dumps({"action": [0.0, 0.0]}))
+        obs = pickle.loads(self.socket.recv())
+        
+        # Get starting position from GNSS
+        start_lat = obs["gnss"]["latitude"]
+        start_lon = obs["gnss"]["longitude"]
+        start_loc = gnss_to_location(start_lat, start_lon)
+        
+        # Choose a random goal and generate route
+        goal_lat, goal_lon = choose_random_coordinate()
+        goal_loc = gnss_to_location(goal_lat, goal_lon)
+        grp = GlobalRoutePlanner(self.map, sampling_resolution=2.0)
+        route = grp.trace_route(start_loc, goal_loc)
+        self.route = [wp.transform.location for wp, _ in route]
+        self.wp_index = 0
+        
+        # Compute initial state
+        state = self.get_state(obs)
+        
+        # Initialize tracking variables
+        self.previous_location = gnss_to_location(start_lat, start_lon)
+        self.previous_timestamp = obs["timestamp"]
+        self.previous_distance = self.get_distance_to_waypoint(obs)
+        self.step_count = 0
+        
+        return state
 
     def step(self, action):
-        data = {"action": action.tolist()}
-        self.socket.send(pickle.dumps(data))
-        response = pickle.loads(self.socket.recv())
+        """Take an action, return next state, reward, done, and info."""
+        # Send action to the server
+        self.socket.send(pickle.dumps({"action": action.tolist()}))
+        obs = pickle.loads(self.socket.recv())
+        
+        # Compute new state
+        state = self.get_state(obs)
+        
+        # Compute reward
+        reward = self.compute_reward(obs)
+        
+        # Check if episode is done
+        done = self.is_done(obs)
+        
+        # Increment step count and check timeout
+        self.step_count += 1
+        if self.step_count >= self.max_steps:
+            done = True
+        
+        # Update previous values
+        self.previous_location = gnss_to_location(obs["gnss"]["latitude"], obs["gnss"]["longitude"])
+        self.previous_timestamp = obs["timestamp"]
+        self.previous_distance = self.get_distance_to_waypoint(obs)
+        
+        return state, reward, done, {}
 
-        obs = self._process_obs(response["image"])
-        reward, done = self._calculate_reward(response)
-        info = response
-        self.prev_info = response
+    def get_state(self, obs):
+        """Compute the current state from observations."""
+        current_loc = gnss_to_location(obs["gnss"]["latitude"], obs["gnss"]["longitude"])
+        
+        if self.wp_index < len(self.route):
+            next_wp_loc = self.route[self.wp_index]
+            distance = current_loc.distance(next_wp_loc)
+            vehicle_yaw = quaternion_to_yaw(obs["imu"]["orientation"])
+            delta_x = next_wp_loc.x - current_loc.x
+            delta_y = next_wp_loc.y - current_loc.y
+            desired_yaw = np.arctan2(delta_y, delta_x)
+            angle_to_waypoint = normalize_angle(desired_yaw - vehicle_yaw)
+        else:
+            distance = 0
+            angle_to_waypoint = 0
+        
+        # Compute speed from position change
+        if self.previous_location is not None and self.previous_timestamp < obs["timestamp"]:
+            time_elapsed = obs["timestamp"] - self.previous_timestamp
+            distance_traveled = current_loc.distance(self.previous_location)
+            speed = distance_traveled / time_elapsed if time_elapsed > 0 else 0
+        else:
+            speed = 0
+        
+        return np.array([distance, angle_to_waypoint, speed], dtype=np.float32)
 
-        return obs, reward, done, False, info
+    def get_distance_to_waypoint(self, obs):
+        """Calculate distance to the current waypoint."""
+        current_loc = gnss_to_location(obs["gnss"]["latitude"], obs["gnss"]["longitude"])
+        if self.wp_index < len(self.route):
+            next_wp_loc = self.route[self.wp_index]
+            return current_loc.distance(next_wp_loc)
+        return 0
 
-    def reset(self, seed=None, options=None):
-        self.socket.send(pickle.dumps({"command": "reset"}))
-        _ = self.socket.recv()
-
-        self.socket.send(pickle.dumps({"action": [0.0, 0.0]}))
-        response = pickle.loads(self.socket.recv())
-
-        obs = self._process_obs(response["image"])
-        self.prev_info = response
-        self.reset_time = time.time()
-
-        return obs, {}
-
-    def _process_obs(self, image_bytes):
-        img = np.frombuffer(image_bytes, dtype=np.uint8).reshape((84, 84))
-        return np.expand_dims(img, axis=0)  # shape = (1, 84, 84)
-
-    def _calculate_reward(self, info):
-        reward = 0
-        done = False
-
-        # === COLLISION ===
-        if info["collision"] is not None:
-            return -100, True
-
-        # === LANE INVASION ===
-        if info["lane_invaded"]["violated"]:
-            return -50, True
-
-        # === GOAL REACHED ===
-        distance = gnss_distance(info["gnss"], self.target_gnss)
-        if distance < 2.0:
-            return 100, True
-
-        # === STUCK ===
-        if is_stuck(info, self.prev_info):
+    def compute_reward(self, obs):
+        """Calculate the reward based on progress and penalties."""
+        current_distance = self.get_distance_to_waypoint(obs)
+        progress = self.previous_distance - current_distance
+        reward = progress
+        
+        # Penalties for collision and lane invasion
+        if obs["collision"] is not None:
+            reward -= 100
+        if obs["lane_invaded"]["violated"]:
             reward -= 10
+        
+        # Speed-based reward
+        speed = self.get_state(obs)[2]
+        if speed < 5 or speed > 10:
+            reward -= 0.1
+        else:
+            reward += 0.1
+        
+        return reward
 
-        # === TIMEOUT ===
-        if time.time() - self.reset_time > self.timeout_sec:
-            return -50, True
+    def is_done(self, obs):
+        """Determine if the episode should terminate."""
+        if self.wp_index >= len(self.route):
+            return True
+        
+        current_distance = self.get_distance_to_waypoint(obs)
+        if current_distance < 2.0:
+            self.wp_index += 1
+            if self.wp_index >= len(self.route):
+                return True
+        
+        if obs["collision"] is not None or obs["lane_invaded"]["violated"]:
+            return True
+        
+        return False
 
-        # === PROGRESS REWARD ===
-        prev_dist = gnss_distance(self.prev_info["gnss"], self.target_gnss) if self.prev_info else distance + 1
-        reward += (prev_dist - distance) * 2  # forward movement
-
-        return reward, done
-
-    def render(self):
-        pass
-
-    def close(self):
-        self.socket.close()
+# Main execution
+if __name__ == "__main__":
+    # Initialize the environment
+    env = CarlaEnv(port=12345)
+    
+    # Create and train the PPO model
+    model = PPO("MlpPolicy", env, verbose=1)
+    model.learn(total_timesteps=100000)
+    
+    # Save the trained model
+    model.save("carla_rl_agent")
