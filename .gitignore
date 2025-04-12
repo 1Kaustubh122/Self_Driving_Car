@@ -1,4 +1,5 @@
-culane_res34.pth
-RL_POLICY/culane_res34.pth
 RL_POLICY/models
+Immitation_Learning_RL/models
+Immitation_Learning_RL/rgb_image
+Immitation_Learning_RL/seg_image
 .vscode
