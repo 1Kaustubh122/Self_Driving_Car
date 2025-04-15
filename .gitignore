@@ -1,11 +1,9 @@
 RL_POLICY/models
 RL_POLICY/__pycache__
 Imitation_Learning_RL/models
-Imitation_Learning_RL/rgb_image
-Imitation_Learning_RL/seg_image
-Imitation_Learning_RL/seg_image_old
+Imitation_Learning_RL/Dataset/rgb_image
+Imitation_Learning_RL/Dataset/seg_image
 Imitation_Learning_RL/logs
-Imitation_Learning_RL/seg_image_old_new
 Imitation_Learning_RL/best_model.pth
 Imitation_Learning_RL/model.pth
 Imitation_Learning_RL/train_log.json
@@ -14,7 +12,6 @@ Imitation_Learning_RL/__pycache__
 Imitation_Learning_RL/model/__pycache__
 Imitation_Learning_RL/data/__pycache__
 Imitation_Learning_RL/checkpoints
-Model
-Imitation_Learning_RL/rgb_image.zip
-Imitation_Learning_RL/seg_image.zip
+Imitation_Learning_RL/Dataset/rgb_image.zip
+Imitation_Learning_RL/Dataset/seg_image.zip
 .vscode
