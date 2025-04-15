@@ -12,4 +12,9 @@ Imitation_Learning_RL/train_log.json
 Imitation_Learning_RL/val_log.json
 Imitation_Learning_RL/__pycache__
 Imitation_Learning_RL/model/__pycache__
+Imitation_Learning_RL/data/__pycache__
+Imitation_Learning_RL/checkpoints
+Model
+Imitation_Learning_RL/rgb_image.zip
+Imitation_Learning_RL/seg_image.zip
 .vscode
