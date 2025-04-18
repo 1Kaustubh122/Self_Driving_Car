@@ -1,5 +1,5 @@
-RL_POLICY/models
-RL_POLICY/__pycache__
+TEST_RL_POLICY/models
+TEST_RL_POLICY/__pycache__
 Imitation_Learning_RL/models
 Imitation_Learning_RL/Dataset/rgb_image
 Imitation_Learning_RL/Dataset/seg_image
