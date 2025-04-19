@@ -1,4 +1,4 @@
-import time
+import cv2
 import torch
 import carla
 import numpy as np
@@ -57,10 +57,13 @@ class CarlaEnv(gym.Env):
             dtype=np.uint8
         )
         
+        
         self.vehicle_ = None
         self.camera_sensor = None
         self.collision_sensor = None
         self.lane_invasion_sensor = None
+        self.stuck_start_time = None
+        self.is_stuck = False
         
         self.max_steps = 1000
         self.episode_step = 0
@@ -90,6 +93,9 @@ class CarlaEnv(gym.Env):
         if seed is not None:
             np.random.seed(seed)
         
+        self.stuck_start_time = None
+        self.is_stuck = False
+    
         # print(self.vehicle_)
         # if self.vehicle_ is not None:
         # for actor in self.world_.get_actors().find("vehicle.volkswagen.t2_2021"):
@@ -104,7 +110,10 @@ class CarlaEnv(gym.Env):
         # for sensor in [self.camera_sensor, self.collision_sensor, self.lane_invasion_sensor]:
         #     if sensor is not None:
         #         sensor.destroy()
-                
+        try:
+            cv2.destroyAllWindows()
+        except:
+            pass
                 
         spawn_point = self.world_.get_map().get_spawn_points()[0]
                 
@@ -194,13 +203,23 @@ class CarlaEnv(gym.Env):
         
         truncated = self.episode_step >= self.max_steps
         
+          
+        combined_image = np.hstack((self.seg_image, self.rgb_image))
+        cv2.imshow("Camera", combined_image)
+        cv2.waitKey(1)
+        
+        
         return obs, reward, done or truncated, truncated, {}
         
     def compute_reward(self):
         reward = 0
         
         current_location = self.vehicle_.get_location()
-       
+        control = self.vehicle_.get_control()
+        current_time = self.world_.get_snapshot().timestamp.elapsed_seconds
+        
+        stuck_duration_threshold = 2.0  # 2 seconds
+            
         while self.current_waypoint_idx < len(self.waypoints) - 1:
             wp = self.waypoints[self.current_waypoint_idx]
             if current_location.distance(wp.transform.location) < 2.0:
@@ -228,6 +247,23 @@ class CarlaEnv(gym.Env):
         speed = np.linalg.norm([velocity.x, velocity.y, velocity.z])
         reward += speed * 0.1
         
+        if not hasattr(self, 'stuck_start_time'):
+            self.stuck_start_time = current_time
+            self.is_stuck = False
+        
+        if speed < 0.2 and control.throttle > 0.3 and control.brake < 0.1:
+            if not self.is_stuck:
+                self.is_stuck = True
+                self.stuck_start_time = current_time
+            elif current_time - self.stuck_start_time > stuck_duration_threshold:
+                reward -= 100.0  # Penalty for being stuck
+                self.is_stuck = False
+                self.stuck_start_time = current_time
+                print(f"Stuck detected! Duration: {current_time - self.stuck_start_time:.2f}s, Speed: {speed:.2f}, Throttle: {control.throttle:.2f}")
+        else:
+            self.is_stuck = False
+            self.stuck_start_time = current_time
+            
         if speed < 0.2:
             reward -= 100.0
 
