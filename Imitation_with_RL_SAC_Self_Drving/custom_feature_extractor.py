@@ -19,8 +19,9 @@ class CustomFeatureExtractor(BaseFeaturesExtractor):
         self.model.throttle_head = nn.Identity()
         self.model.brake_head = nn.Identity()
         
-        for param in self.model.parameters():
-            param.requires_grad = False
+        for name, param in self.model.parameters():
+            if 'lstm' in name:
+                param.requires_grad = False
             
         # self.model.to(self.device)
             
