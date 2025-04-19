@@ -1,15 +1,19 @@
-import torch
+import os
 import cv2
+import sys
+import torch
+import logging
 import numpy as np
 import scipy.special
 from PIL import Image
-from model.model import parsingNet
-from data.constant import tusimple_row_anchor
-from torchvision import transforms
 from ultralytics import YOLO
-import time
-import logging
+sys.path.append('/home/kaustubh/Documents/GitHub/Self_Driving_Car/Imitation_Learning_RL')
+sys.path.append('/home/kaustubh/Documents/GitHub/Self_Driving_Car/Imitation_Learning_RL/model')
+sys.path.append('/home/kaustubh/Documents/GitHub/Self_Driving_Car/Imitation_Learning_RL/model')
+from model.model import parsingNet
+from torchvision import transforms
 from ultralytics.utils import LOGGER
+from data.constant import tusimple_row_anchor
 
 # Suppress YOLO logs
 LOGGER.setLevel(logging.ERROR)
@@ -20,7 +24,7 @@ GRIDDING_NUM = 100
 CLS_NUM_PER_LANE = 56
 ROW_ANCHOR = tusimple_row_anchor
 BACKBONE = '18'
-LANE_MODEL_PATH = 'models/tusimple_18.pth'
+LANE_MODEL_PATH = os.path.join(os.path.dirname(__file__), 'models', 'tusimple_18.pth')
 YOLO_MODEL_PATH = 'models/yolo11m-seg'  # Note: Use 'yolo11s-seg.pt' if segmentation is needed
 
 # --- DEVICE ---

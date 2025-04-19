@@ -1,3 +1,4 @@
+import time
 import torch
 import carla
 import numpy as np
@@ -42,7 +43,7 @@ class CarlaEnv(gym.Env):
         self.blueprint_library_ = self.world_.get_blueprint_library()
 
                         # Steer, Throttle, Brake
-        self.action_space_ = gym.spaces.Box(
+        self.action_space = gym.spaces.Box(
             low= np.array([-1.0, 0.0, 0.0]),
             high= np.array([1.0, 1.0, 1.0]),
             dtype=np.float32
@@ -52,7 +53,7 @@ class CarlaEnv(gym.Env):
         self.observation_space = gym.spaces.Box(
             low=0, 
             high=255,
-            shape=(5, 640, 360), 
+            shape=(5, 360, 640), 
             dtype=np.uint8
         )
         
@@ -88,13 +89,21 @@ class CarlaEnv(gym.Env):
     def reset(self, seed = None, options = None):
         if seed is not None:
             np.random.seed(seed)
-            
-        if self.vehicle_ is not None:
-            self.vehicle_.destroy()
-            
-        for sensor in [self.camera_sensor, self.collision_sensor, self.lane_invasion_sensor]:
-            if sensor is not None:
-                sensor.destroy()
+        
+        # print(self.vehicle_)
+        # if self.vehicle_ is not None:
+        # for actor in self.world_.get_actors().find("vehicle.volkswagen.t2_2021"):
+        #     print(actor)
+        #     actor.destroy()
+        
+        for actor in self.world_.get_actors().filter('vehicle.volkswagen.t2_2021'):
+            actor.destroy()
+        for sensor in self.world_.get_actors().filter('*sensor*'):
+            sensor.destroy()
+                
+        # for sensor in [self.camera_sensor, self.collision_sensor, self.lane_invasion_sensor]:
+        #     if sensor is not None:
+        #         sensor.destroy()
                 
                 
         spawn_point = self.world_.get_map().get_spawn_points()[0]
@@ -108,7 +117,10 @@ class CarlaEnv(gym.Env):
         camera_bp_.set_attribute('image_size_y', '360')
         
         self.vehicle_ = self.world_.try_spawn_actor(vehicle_bp_, spawn_point)
-    
+        
+        if self.vehicle_ is None:
+            raise RuntimeError("Vehicle failed to spawn. Likely due to occupied spawn point or invalid config.")
+
         camera_location = carla.Location(x=4.442184 / 2.9, y=0, z=2.2)
         
         camera_transform = carla.Transform(camera_location)
@@ -142,20 +154,32 @@ class CarlaEnv(gym.Env):
             self.world_.tick()
         
         obs = pre_process(self.rgb_image, self.seg_image, transform = None).numpy()
-        return obs
+        return obs.astype(np.uint8)
+
     
     def step(self, action):
+   
+        # print(action)
         
+        if self.lane_invasion:
+            print("Lane Invaded")
+        if self.collision:
+            print("collided")
         steer_, throttle_, brake_  = action
         # brake_ = 1.0 if brake_ > 0.65 else 0.0
-        brake = max(min(brake_, 1.0), 0.0)
+        # brake = max(min(brake_, 1.0), 0.0)
         
         self.vehicle_.apply_control(carla.VehicleControl(
             throttle = float(throttle_),
+            # throttle = 1.0,
             steer = float(steer_),
-            brake = float(brake)
+            # brake = 0, 
+            brake = 1.0 if brake_ > 0.8 else 0, 
+            hand_brake=False
         ))
+        
         self.world_.tick()
+     
         
         obs = self.get_observation()
         reward = self.compute_reward()
@@ -163,7 +187,7 @@ class CarlaEnv(gym.Env):
         
         done = (
             self.collision or
-            # self.lane_invasion or    ## Add later give time to learn first
+            self.lane_invasion or    
             self.episode_step >= self.max_steps or
             self.current_waypoint_idx >= len(self.waypoints) - 1
         )
@@ -188,7 +212,7 @@ class CarlaEnv(gym.Env):
         if self.collision:
             reward -= 100.0
         if self.lane_invasion:
-            reward -= 20.0
+            reward -= 100.0
         
         map_ = self.world_.get_map()
         wp = map_.get_waypoint(current_location)
@@ -205,7 +229,9 @@ class CarlaEnv(gym.Env):
         reward += speed * 0.1
         
         if speed < 0.2:
-            reward -= 5.0
+            reward -= 100.0
 
 
-        reward = np.clip(reward, -100, 50.0)
+        # reward = np.clip(reward, -100, 50.0)
+        
+        return reward

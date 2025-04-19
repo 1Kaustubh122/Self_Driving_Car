@@ -1,7 +1,8 @@
 import torch
-from model.backbone import resnet
+from backbone import resnet
 import numpy as np
-
+import sys
+print(sys.path)
 class conv_bn_relu(torch.nn.Module):
     def __init__(self,in_channels, out_channels, kernel_size, stride=1, padding=0, dilation=1,bias=False):
         super(conv_bn_relu,self).__init__()

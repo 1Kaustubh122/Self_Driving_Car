@@ -15,4 +15,6 @@ Imitation_Learning_RL/checkpoints
 Imitation_Learning_RL/Dataset/rgb_image.zip
 Imitation_Learning_RL/Dataset/seg_image.zip
 Imitation_Learning_RL/DAgger
+Imitation_with_RL_SAC_Self_Drving/models
+Imitation_with_RL_SAC_Self_Drving/__pycache__
 .vscode
