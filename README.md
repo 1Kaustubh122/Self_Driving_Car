@@ -1,13 +1,39 @@
-🏎️ Self-Driving Car in CARLA Simulator
-Built a self-driving car pipeline in the CARLA simulator. Started with Proximal Policy Optimization (PPO) to validate the RL setup. Then shifted to Imitation Learning (IL):
+# 🏎️ Self-Driving Car in CARLA Simulator
 
-📦 Collected expert driving data (RGB + segmentation images + control actions)
+This project implements a self-driving car pipeline in the CARLA simulator using Imitation Learning (IL) and Reinforcement Learning (RL). The system evolves from expert data collection to Behavior Cloning (BC) with a custom ResNet18 architecture, followed by fine-tuning using Soft Actor-Critic (SAC). A ZeroMQ-based client-server setup connects the agent to the CARLA environment.
 
-🤖 Trained a multi-output Behavior Cloning (BC) model
+## 🚀 Project Overview
 
-🔁 Integrated DAgger to iteratively improve policy with expert corrections
+### ✔️ Stages:
+1. **PPO Baseline (RL)**  
+   - Initial experiments using Proximal Policy Optimization (PPO) to validate environment setup and agent control loop.
 
-🔧 Used the IL-trained model as a warm-start for Soft Actor-Critic (SAC) to fine-tune with reinforcement learning, improving robustness and long-term planning.
+2. **Behavior Cloning (Imitation Learning)**  
+   - Collected expert data with RGB + segmentation images and control actions (steer, throttle, brake).
+   - Trained a custom **ResNet18** model with **5-channel input** (RGB + Seg) as a multi-output regressor.
 
-Supports sensor fusion, modular architecture, and ZeroMQ-based client-server design between CARLA and agent.
+3. **SAC Fine-Tuning (RL with IL Warm Start)**  
+   - Used the pretrained BC model to warm-start a Soft Actor-Critic (SAC) agent.
+   - RL fine-tuning improved robustness and long-term performance.
+
+
+- ✅ Multi-stage learning: BC → SAC
+- ✅ Custom ResNet18 with 5-channel input (RGB + Segmentation)
+- ✅ Modular architecture using ZeroMQ for different environment communication
+- ✅ Multi-output regression for steering, throttle, and brake
+
+
+## 🖼️ Data Collection
+
+Expert data includes:
+- `rgb_image/`: Front camera RGB images
+- `seg_image/`: Semantic segmentation images
+- `logs/logs.json`: GNSS, IMU, speed, control actions (steer, throttle, brake)
+
+## 📦 Installation
+
+```bash
+# Clone repo
+git clone https://github.com/your-username/self-driving-car-carla.git
+cd self-driving-car-carla
 
