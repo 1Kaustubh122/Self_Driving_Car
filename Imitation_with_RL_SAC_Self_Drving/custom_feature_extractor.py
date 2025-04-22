@@ -13,8 +13,8 @@ class CustomFeatureExtractor(BaseFeaturesExtractor):
         checkpoint = torch.load(MODEL_PATH, map_location='cpu')
         self.model.load_state_dict(checkpoint['model_state_dict'])
         
-        # self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.device = 'cpu'
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # self.device = 'cpu'
         
         self.model.fc = nn.Identity()
         self.model.steer_head = nn.Identity()

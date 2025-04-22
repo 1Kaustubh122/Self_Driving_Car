@@ -34,10 +34,10 @@ def pre_process(rgb_image, seg_image, transform):
     return input_tensor
 
 class CarlaEnv(gym.Env):
-    def __init__(self):
+    def __init__(self, host='localhost', port=2000):
         super(CarlaEnv, self).__init__()
         
-        self.client_ = carla.Client('localhost', 2000)
+        self.client_ = carla.Client(host, port)
         self.client_.set_timeout(10.0)
         self.world_ = self.client_.get_world()
         self.blueprint_library_ = self.world_.get_blueprint_library()
@@ -75,6 +75,9 @@ class CarlaEnv(gym.Env):
         self.seg_image = None
         self.collision = False
         self.lane_invasion = False
+        self.steer_lock_start_time = None
+        self.is_steer_locked = False
+
         
     # Sensors Callbacks
     def image_callback(self, data):
@@ -82,6 +85,24 @@ class CarlaEnv(gym.Env):
         array = np.reshape(array, (data.height, data.width, 4))[:, :, :3]
         self.rgb_image = array
         self.seg_image = process_frame(self.rgb_image)
+
+    def draw_waypoints(self, waypoints, life_time=100.0):
+        for wp in waypoints:
+            self.world_.debug.draw_point(
+                wp.transform.location + carla.Location(z=0.5),
+                size=0.1,
+                color=carla.Color(r=0, g=255, b=0),
+                life_time=life_time
+            )
+            self.world_.debug.draw_arrow(
+                wp.transform.location,
+                wp.transform.location + wp.transform.get_forward_vector() * 2,
+                thickness=0.1,
+                arrow_size=0.2,
+                color=carla.Color(r=255, g=0, b=0),
+                life_time=life_time
+            )
+
 
     def collision_callback(self, data):
         self.collision = True
@@ -155,6 +176,8 @@ class CarlaEnv(gym.Env):
             next_wp = self.waypoints[-1].next(5.0)
             self.waypoints.append(next_wp[0] if next_wp else self.waypoints[-1])
         self.current_waypoint_idx = 0
+        self.draw_waypoints(self.waypoints)
+
         
         return self.get_observation(), {}
     
@@ -170,10 +193,10 @@ class CarlaEnv(gym.Env):
    
         # print(action)
         
-        if self.lane_invasion:
-            print("Lane Invaded")
-        if self.collision:
-            print("collided")
+        # if self.lane_invasion:
+        #     print("Lane Invaded")
+        # if self.collision:
+        #     print("collided")
         steer_, throttle_, brake_  = action
         # brake_ = 1.0 if brake_ > 0.65 else 0.0
         # brake = max(min(brake_, 1.0), 0.0)
@@ -259,11 +282,27 @@ class CarlaEnv(gym.Env):
                 reward -= 100.0  # Penalty for being stuck
                 self.is_stuck = False
                 self.stuck_start_time = current_time
-                print(f"Stuck detected! Duration: {current_time - self.stuck_start_time:.2f}s, Speed: {speed:.2f}, Throttle: {control.throttle:.2f}")
+                # print(f"Stuck detected! Duration: {current_time - self.stuck_start_time:.2f}s, Speed: {speed:.2f}, Throttle: {control.throttle:.2f}")
         else:
             self.is_stuck = False
             self.stuck_start_time = current_time
-            
+        
+        steer_lock_threshold = 0.9
+        steer_lock_duration_threshold = 4.0  # seconds
+
+        if abs(control.steer) > steer_lock_threshold:
+            if not self.is_steer_locked:
+                self.is_steer_locked = True
+                self.steer_lock_start_time = current_time
+            elif current_time - self.steer_lock_start_time > steer_lock_duration_threshold:
+                reward -= 50.0 
+                self.is_steer_locked = False
+                self.steer_lock_start_time = current_time 
+        else:
+            self.is_steer_locked = False
+            self.steer_lock_start_time = current_time
+
+
         if speed < 0.2:
             reward -= 100.0
 
