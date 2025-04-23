@@ -131,10 +131,10 @@ class CarlaEnv(gym.Env):
         # for sensor in [self.camera_sensor, self.collision_sensor, self.lane_invasion_sensor]:
         #     if sensor is not None:
         #         sensor.destroy()
-        try:
-            cv2.destroyAllWindows()
-        except:
-            pass
+        # try:
+        #     cv2.destroyAllWindows()
+        # except:
+        #     pass
                 
         spawn_point = self.world_.get_map().get_spawn_points()[0]
                 
@@ -227,9 +227,9 @@ class CarlaEnv(gym.Env):
         truncated = self.episode_step >= self.max_steps
         
           
-        combined_image = np.hstack((self.seg_image, self.rgb_image))
-        cv2.imshow("Camera", combined_image)
-        cv2.waitKey(1)
+        # combined_image = np.hstack((self.seg_image, self.rgb_image))
+        # cv2.imshow("Camera", combined_image)
+        # cv2.waitKey(1)
         
         
         return obs, reward, done or truncated, truncated, {}
