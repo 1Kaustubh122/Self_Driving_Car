@@ -1,14 +1,17 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchvision.models import resnet18
+from torchvision.models import resnet18, resnet34
 
 
 class ImitationResNet(nn.Module):
-    def __init__(self, pretrained=True):
+    def __init__(self, pretrained=True, backbone='resnet34'):
         super(ImitationResNet, self).__init__()
 
-        base_model = resnet18(pretrained=pretrained)
+        if backbone == 'resnet34':
+            base_model = resnet34(pretrained=pretrained)
+        else:
+            base_model = resnet18(pretrained=pretrained)
         
         self.conv1 = nn.Conv2d(5, 64, kernel_size=7, stride=2, padding=3, bias=False)
         self.bn1 = base_model.bn1
