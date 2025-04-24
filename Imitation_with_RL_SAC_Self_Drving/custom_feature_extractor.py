@@ -1,11 +1,13 @@
 import torch
 import torch.nn as nn
 import gymnasium as gym
+import torch.nn.functional as F
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 from Imitation_Learning_RL.model.ImitationResNet import ImitationResNet
 
+
 class UnifiedFeatureExtractor(BaseFeaturesExtractor):
-    def __init__(self, observation_space: gym.spaces.Dict,  features_dim: int = 772):
+    def __init__(self, observation_space: gym.spaces.Dict,  features_dim: int = 512):
         super().__init__(observation_space, features_dim=features_dim)
         self.model = ImitationResNet(pretrained=False)
         MODEL_PATH = "models/bc_model.pth"
@@ -33,6 +35,7 @@ class UnifiedFeatureExtractor(BaseFeaturesExtractor):
         self.combine_fc.to(self.device)
 
     def forward(self, observations: dict) -> torch.Tensor:
+
 
         image_obs = observations["image"]
 
@@ -65,6 +68,11 @@ class UnifiedFeatureExtractor(BaseFeaturesExtractor):
 
         return output
 
+
+
+
+
+## OLD FEATURE EXTRACTOR ---- Only Images
 # class CustomFeatureExtractor(BaseFeaturesExtractor):
 #     def __init__(self, observation_space:gym.spaces.Box, features_dim: int = 768):
 #         super().__init__(observation_space, features_dim=features_dim)
