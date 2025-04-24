@@ -20,7 +20,7 @@ LOGGER.setLevel(logging.ERROR)
 
 
 
-IMG_W, IMG_H = 640, 360 
+IMG_W, IMG_H = 128, 128 
 GRIDDING_NUM = 100
 CLS_NUM_PER_LANE = 56
 ROW_ANCHOR = tusimple_row_anchor
@@ -30,6 +30,7 @@ YOLO_MODEL_PATH = 'models/yolo11m-seg'
 
 # DEVICE
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# device = "cpu"
 
 #  Load LaneNet 
 lane_net = parsingNet(pretrained=False, backbone=BACKBONE,
