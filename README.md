@@ -34,6 +34,6 @@ Expert data includes:
 
 ```bash
 # Clone repo
-git clone https://github.com/your-username/self-driving-car-carla.git
-cd self-driving-car-carla
+git clone https://github.com/1Kaustubh122/Self_Driving_Car
+cd Self_Driving_Car
 
