@@ -1,5 +1,5 @@
 import torch
-from backbone import resnet
+from model.backbone import resnet
 import numpy as np
 import sys
 print(sys.path)
