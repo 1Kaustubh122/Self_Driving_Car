@@ -17,4 +17,9 @@ Imitation_Learning_RL/Dataset/seg_image.zip
 Imitation_Learning_RL/DAgger
 Imitation_with_RL_SAC_Self_Drving/models
 Imitation_with_RL_SAC_Self_Drving/__pycache__
+models
+Imitation_with_RL_SAC_Self_Drving/checkpoints
+Imitation_with_RL_SAC_Self_Drving/tensorboard_logs
+tensorboard_logs
+Imitation_Learning_RL/data/__pycache__
 .vscode
