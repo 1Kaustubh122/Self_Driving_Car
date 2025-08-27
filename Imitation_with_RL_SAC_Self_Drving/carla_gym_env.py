@@ -1,184 +1,173 @@
 import os
 import cv2
+import sys
 import time
-import torch
 import carla
+import random
 import logging
 import numpy as np
 import gymnasium as gym
-from threading import Lock
-import torch.nn.functional as F
-import torchvision.transforms as T
 from gymnasium.spaces import Dict, Box 
-import torchvision.transforms as transforms
+
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+if ROOT_DIR not in sys.path:
+    sys.path.insert(0, ROOT_DIR)
+    
 from Imitation_Learning_RL.process_frame import process_frame
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-def pre_process(rgb_image, seg_image, transform=None, device="cuda" if torch.cuda.is_available() else "cpu"):
-    # Resize
-    rgb_image = cv2.resize(rgb_image, (128, 128))
-    seg_image = cv2.resize(seg_image, (128, 128))
+def pre_process(rgb_rgb: np.ndarray, seg_img: np.ndarray) -> np.ndarray:
+    H, W = 128, 128
+    rgb = cv2.resize(rgb_rgb, (W, H), interpolation=cv2.INTER_LINEAR).astype(np.float32) / 255.0
+    seg = cv2.resize(seg_img, (W, H), interpolation=cv2.INTER_NEAREST)
 
-    if transform:
-        rgb_tensor = transform(rgb_image)
-    else:
-        rgb_tensor = transforms.ToTensor()(rgb_image).to(device)  # (3, 128, 128)
+    # If seg is color-coded, derive 2 channels via simple thresholds. Adjust if you have class IDs.
+    lane = ((np.abs(seg[:, :, 1] - 255) < 1) & (seg[:, :, 0] < 2) & (seg[:, :, 2] < 2)).astype(np.float32)
+    obs  = ((np.abs(seg[:, :, 2] - 255) < 1) & (seg[:, :, 0] < 2) & (seg[:, :, 1] < 2)).astype(np.float32)
 
-    # Masks
-    lane_mask = np.all(seg_image == [0, 255, 0], axis=2).astype(np.uint8)
-    obs_mask  = np.all(seg_image == [255, 0, 0], axis=2).astype(np.uint8)
-    seg_tensor = torch.tensor(np.stack([lane_mask, obs_mask], axis=0), dtype=torch.float32).to(device)  # (2, 128, 128)
+    imgCHW = np.transpose(rgb, (2, 0, 1))                 # (3,H,W)
+    segCHW = np.stack([lane, obs], axis=0)                # (2,H,W)
+    out = np.concatenate([imgCHW, segCHW], axis=0)        # (5,H,W)
+    return out.astype(np.float32)
 
-    # If you interpolate, do it on a 4D tensor, then squeeze:
-    if seg_tensor.shape[1:] != rgb_tensor.shape[1:]:
-        seg_tensor = F.interpolate(
-            seg_tensor.unsqueeze(0),  # (1, 2, H, W)
-            size=rgb_tensor.shape[1:],
-            mode='nearest'
-        ).squeeze(0)  # (2, H, W)
+def get_actor_blueprints(world, filter, generation = 'all'):
+    bps = world.get_blueprint_library().filter(filter)
 
-    # Now both are (C, H, W)
-    input_tensor = torch.cat([rgb_tensor, seg_tensor], dim=0)  # (5, 128, 128)
-    return input_tensor
-
-# def pre_process(rgb_image, seg_image, transform, device="cuda" if torch.cuda.is_available() else "cpu"):
-
-#     # Resizing image to save GPU memory, it sucks
-#     rgb_image = cv2.resize(rgb_image, (128, 128))
-#     seg_image = cv2.resize(seg_image, (128, 128))
-    
-#     if transform:
-#         rgb_tensor = transform(rgb_image)
-#     else:
-#         rgb_tensor = transforms.ToTensor()(rgb_image).to(device)
-
-#     seg_image = np.array(seg_image)
-    
-#     lane_mask = np.all(seg_image == [0, 255, 0], axis=2).astype(np.uint8)
-#     obs_mask = np.all(seg_image == [255, 0, 0], axis=2).astype(np.uint8)
-    
-#     seg_tensor = torch.tensor(np.stack([lane_mask, obs_mask], axis=0), dtype=torch.float32).to(device)
-    
-#     if seg_tensor.shape[1:] != rgb_tensor.shape[1:]:
-#         seg_tensor = F.interpolate(
-#             seg_tensor.unsqueeze(0),
-#             size=rgb_tensor.shape[1:],
-#             mode='nearest'
-#         ).squeeze(0)
-    
-#     input_tensor = torch.cat([rgb_tensor, seg_tensor], dim=0)
-    
-#     return input_tensor
-
+    if generation.lower() == "all":
+        return bps
 
 class CarlaEnv(gym.Env):
-    # def __init__(self, host='localhost', port=2000):
     def __init__(self, host, port):
-
-        self.rgb_count = 0
-        self.seg_count = 0
         super(CarlaEnv, self).__init__()
-        
+
+        import queue
+        self._q = queue.Queue(maxsize=1)
+        self._actors = []
+
         self.client_ = carla.Client(host, port)
         self.client_.set_timeout(10.0)
         self.world_ = self.client_.get_world()
+        self._orig_settings = self.world_.get_settings()
+        
+        traffic_manager = self.client_.get_trafficmanager()
+        traffic_manager.set_global_distance_to_leading_vehicle(2.5)
+        traffic_manager.set_respawn_dormant_vehicles(True)
+        traffic_manager.set_hybrid_physics_mode(True)
+        traffic_manager.set_hybrid_physics_radius(70.0)
+
         self.blueprint_library_ = self.world_.get_blueprint_library()
         self.map_ = self.world_.get_map()
         self.spawn_points_ = self.map_.get_spawn_points()
-        self.start_point_ = self.spawn_points_[0]
-
+        self.start_point_ = self.spawn_points_[0] if self.spawn_points_ else carla.Transform()
 
         self.vehicle_bp = self.blueprint_library_.find('vehicle.volkswagen.t2_2021')
-        # self.vehicle_bp = self.blueprint_library_.find('vehicle.mini.cooper')
-        self.vehicle_ = None
 
-        camera_location = carla.Location(
-            x=4.442184 / 2.9 , 
-            y=0,
-            z=2.2
-        )
-        
+        # Camera bp prepared once; spawned in reset
         self.camera_bp_ = self.blueprint_library_.find('sensor.camera.rgb')
         self.camera_bp_.set_attribute('image_size_x', '128')
         self.camera_bp_.set_attribute('image_size_y', '128')
-        self.camera_sensor = None
-        self.camera_transform = carla.Transform(camera_location)
-        self.rgb_image = None
-        self.seg_image = None
-        self.image_lock = Lock()
+        self.camera_transform = carla.Transform(carla.Location(x=4.442184/2.9, y=0, z=2.2))
 
-
-        self.collision_lock = Lock()
         self.collision_bp = self.blueprint_library_.find("sensor.other.collision")
-        self.collision_transform = carla.Transform()
-        self.collision_sensor = None
-        self.collision = None
+        self.lane_inv_bp  = self.blueprint_library_.find("sensor.other.lane_invasion")
 
-        self.lane_lock = Lock()
-        self.lane_inv_bp = self.blueprint_library_.find("sensor.other.lane_invasion")
-        self.lane_inv_transform = carla.Transform()
-        self.lane_invasion_sensor = None
-        self.lane_invasion = False
-
-        self.wp_draw_lock = Lock()
-
-
-                        # Steer, Throttle, Brake
+        # Action/obs spaces
         self.action_space = gym.spaces.Box(
-            low= np.array([-1.0, 0.0, 0.0]),
-            high= np.array([1.0, 1.0, 1.0]),
+            low=np.array([-1.0, 0.0, 0.0], dtype=np.float32),
+            high=np.array([ 1.0, 1.0, 1.0], dtype=np.float32),
             dtype=np.float32
         )
-        
-                                # 5 Channel image (244 x 244)
-                                # [speed, steer, throttle, brake] Max and min values (high and low)
         self.observation_space = Dict({
-            "image": Box(low=0, high=255, shape=(5, 128, 128), dtype=np.uint8),
+            "image": Box(low=0.0, high=1.0, shape=(5, 128, 128), dtype=np.float32),
             "state": Box(
-                low=np.array([0.0, -1.0, 0.0, 0.0, 0.0, -np.pi]),
-                high=np.array([100.0, 1.0, 1.0, 1.0, 100.0, np.pi]), 
-                shape=(6,), 
-                dtype=np.float32
+                low=np.array([0.0, -1.0, 0.0, 0.0, 0.0, -np.pi], dtype=np.float32),
+                high=np.array([60.0,  1.0, 1.0, 1.0, 100.0,  np.pi], dtype=np.float32),
+                shape=(6,), dtype=np.float32
             )
         })
-        
-       
-        self.stuck_start_time = None
-        self.is_stuck = False
-        
+
+        # Runtime flags
         self.max_steps = 6000
         self.episode_step = 0
+        self.collision = False
+        self.lane_invasion = False
+        self.lane_inv_count = 0
+        self.is_stuck = False
+        self.stuck_start_time = None
+        self.prev_steer = 0.0
         self.previous_location = None
         self.waypoints = []
         self.current_waypoint_idx = 0
-        
-        
-        self.steer_lock_start_time = None
-        self.is_steer_locked = False
-        self.prev_steer = 0.0
 
+        # Placeholders for actors
+        self.vehicle_ = None
+        self.camera_sensor = None
+        self.collision_sensor = None
+        self.lane_invasion_sensor = None
         
-    # Sensors Callbacks
-    def image_callback(self, data):
-        array = np.frombuffer(data.raw_data, dtype=np.uint8)
-        array = np.reshape(array, (data.height, data.width, 4))[:, :, :3]
-        with self.image_lock:
-            self.rgb_image = array
-            self.rgb_count += 1
-            self.seg_image = process_frame(self.rgb_image)
-            self.seg_count += 1
+        self.brake_on_since = None
+        self.no_move_since = None
+
+        blueprints = get_actor_blueprints(self.world_, "vehicle.*", generation='all')
+        blueprints = [x for x in blueprints if x.get_attribute('base_type') == 'car']
+
+        spawn_points = self.world_.get_map().get_spawn_points()
+ 
+        SpawnActor = carla.command.SpawnActor
+        SetAutopilot = carla.command.SetAutopilot
+        FutureActor = carla.command.FutureActor
+        
+        number_of_vehicles = 20
+        
+        batch = []
+        for n, transform in enumerate(spawn_points):
+            if n >= number_of_vehicles:
+                break
+            blueprint = random.choice(blueprints)
+            # print(blueprint) 
+
+            blueprint.set_attribute('role_name', 'autopilot')
+
+        #     # spawn the cars and set their autopilot and light state all together
+            batch.append(SpawnActor(blueprint, transform)
+                .then(SetAutopilot(FutureActor, True, traffic_manager.get_port())))
             
+        self.vehicles_list = []
+            
+        for response in self.client_.apply_batch_sync(batch, False):
+            if response.error:
+                pass
+            else:
+                self.vehicles_list.append(response.actor_id)
 
-    def collision_callback(self, data):
-        with self.collision_lock:
-            self.collision = True
+        
+    # # Sensors Callbacks
+    # def image_callback(self, data):
+    #     array = np.frombuffer(data.raw_data, dtype=np.uint8)
+    #     array = np.reshape(array, (data.height, data.width, 4))[:, :, :3]
+    #     with self.image_lock:
+    #         self.rgb_image = array
+    #         self.rgb_count += 1
+    #         self.seg_image = process_frame(self.rgb_image)
+    #         self.seg_count += 1
+            
+    def _apply_sync_settings(self):
+        s = self.world_.get_settings()
+        s.synchronous_mode = True
+        s.fixed_delta_seconds = 0.05
+        s.no_rendering_mode = False  # set True if running headless for speed
+        self.world_.apply_settings(s)
 
-    def lane_invasion_callback(self, data):
-        with self.lane_lock:
-            self.lane_invasion = True
+    def collision_callback(self, event):
+        self.collision = True
 
+    def lane_invasion_callback(self, event):
+        self.lane_invasion = True
+        self.lane_inv_count += 1
+
+    # # call to draw waypoints on map
     def draw_waypoints(self, waypoints, life_time=100.0):
         with self.wp_draw_lock:
             for wp in waypoints:
@@ -198,482 +187,263 @@ class CarlaEnv(gym.Env):
                 )
     
     def destroy_actors(self):
-        if self.camera_sensor is not None:
-            self.camera_sensor.stop()
-            self.camera_sensor.destroy()
-            self.camera_sensor = None
-
-
-        if self.collision_sensor is not None:
-            self.collision_sensor.stop()
-            self.collision_sensor.destroy()
-            self.collision = None
-            self.collision_sensor = None
+        for a in reversed(self._actors):
+            try:
+                if isinstance(a, carla.Sensor):
+                    a.stop()
+                a.destroy()
+            except:
+                pass
+        self._actors.clear()
+        self.vehicle_ = None
+        self.camera_sensor = None
+        self.collision_sensor = None
+        self.lane_invasion_sensor = None
         
-        if self.lane_invasion_sensor is not None:
-            self.lane_invasion_sensor.stop()
-            self.lane_invasion_sensor.destroy()
-            self.lane_invasion_sensor = None
-            self.lane_invasion = None
+    def _tick_and_get_frame(self, timeout=1.0):
         
-        if self.vehicle_ is not None:
-            self.vehicle_.destroy()
-            self.vehicle_ = None
-
-        try:
-            for actor in self.world_.get_actors().filter('*vehicle*'):
-                actor.destroy()
-            for sensor in self.world_.get_actors().filter('*sensor*'):
-                sensor.destroy()
-        except:
-            pass
+        self.world_.tick()
+        img = self._q.get(timeout=timeout)  # carla.Image
+        arr = np.frombuffer(img.raw_data, dtype=np.uint8).reshape(img.height, img.width, 4)
+        bgr = arr[:, :, :3]                 # BGRA -> BGR
+        rgb = bgr[:, :, ::-1].copy()        # to RGB
+        return rgb, bgr
+    
+    @staticmethod
+    def _signed_angle_2d(a: carla.Vector3D, b: carla.Vector3D) -> float:
+        dot = a.x*b.x + a.y*b.y
+        det = a.x*b.y - a.y*b.x
         
-    def reset(self, seed = None, options = None):
+        return float(np.arctan2(det, np.clip(dot, -1.0, 1.0)))
 
-        self.episode_step = 0
-        self.stuck_start_time = None
+    @staticmethod
+    def _shield(obs_state, action, ttc=None, dist_lead=None):
 
-
+        steer, thr, brk = map(float, action)
+        if ttc is not None and ttc < 1.2:
+            return np.array([np.clip(steer, -0.2, 0.2), 0.0, 1.0], dtype=np.float32), True
+        
+        if dist_lead is not None and dist_lead < 7.0:
+            return np.array([np.clip(steer, -0.2, 0.2), 0.0, 1.0], dtype=np.float32), True
+        
+        return np.array([steer, thr, brk], dtype=np.float32), False
+        
+    def reset(self, seed=None, options=None):
         if seed is not None:
             np.random.seed(seed)
 
-        # destroy all actors
-        self.destroy_actors()
-
-        self.destroy_actors()
-        
-        self.vehicle_ = self.world_.try_spawn_actor(self.vehicle_bp, self.start_point_)
-        
-        self.camera_sensor = self.world_.spawn_actor(self.camera_bp_, self.camera_transform, attach_to=self.vehicle_)
-        self.camera_sensor.listen(lambda data: self.image_callback(data))
-        
-        self.collision_sensor = self.world_.spawn_actor(self.collision_bp, self.collision_transform, attach_to=self.vehicle_)
-        self.collision_sensor.listen(lambda data: self.collision_callback(data))
-        
-        self.lane_invasion_sensor = self.world_.spawn_actor(self.lane_inv_bp, self.lane_inv_transform, attach_to=self.vehicle_)
-        self.lane_invasion_sensor.listen(lambda event: self.lane_invasion_callback(event))
-        
-
-        
-        self.stuck_start_time = None
-        self.is_stuck = False
-    
-        # try:
-        #     cv2.destroyAllWindows()
-        # except:
-        #     pass
-                
-        spawn_point = self.world_.get_map().get_spawn_points()[0]
-        
-    
-        
         self.episode_step = 0
         self.collision = False
         self.lane_invasion = False
-        # print(self.vehicle_)
-        self.previous_location = self.vehicle_.get_location()
+        self.lane_inv_count = 0
+        self.is_stuck = False
+        self.stuck_start_time = None
         self.prev_steer = 0.0
-        
+
+        # del acts
+        self.destroy_actors()
+        self._apply_sync_settings()
+
+        # Spawn ego
+        spawn_points = self.map_.get_spawn_points()
+        sp = spawn_points[0] if spawn_points else carla.Transform()
+        self.vehicle_ = self.world_.try_spawn_actor(self.vehicle_bp, sp)
+        if self.vehicle_ is None:
+            # fallback: random
+            for spx in random.sample(spawn_points, k=len(spawn_points)):
+                self.vehicle_ = self.world_.try_spawn_actor(self.vehicle_bp, spx)
+                if self.vehicle_ is not None:
+                    break
+        if self.vehicle_ is None:
+            raise RuntimeError("Failed to spawn vehicle")
+        self._actors.append(self.vehicle_)
+
+        # Camera
+        self.camera_sensor = self._spawn(self.camera_bp_, self.camera_transform, attach_to=self.vehicle_)
+        self.camera_sensor.listen(lambda data: (self._q.queue.clear(), self._q.put(data)) if not self._q.empty() else self._q.put(data))
+
+        # Collision + lane invasion
+        self.collision_sensor = self._spawn(self.collision_bp, carla.Transform(), attach_to=self.vehicle_)
+        self.collision_sensor.listen(self.collision_callback)
+        self.lane_invasion_sensor = self._spawn(self.lane_inv_bp, carla.Transform(), attach_to=self.vehicle_)
+        self.lane_invasion_sensor.listen(self.lane_invasion_callback)
+
+        # Route 
         map_ = self.world_.get_map()
-        self.waypoints = [map_.get_waypoint(spawn_point.location)]
+        base_wp = map_.get_waypoint(sp.location if 'sp' in locals() else self.vehicle_.get_location())
+        self.waypoints = [base_wp]
         for _ in range(50):
-            next_wp = self.waypoints[-1].next(5.0)
-            self.waypoints.append(next_wp[0] if next_wp else self.waypoints[-1])
+            nxt = self.waypoints[-1].next(5.0)
+            self.waypoints.append(nxt[0] if nxt else self.waypoints[-1])
         self.current_waypoint_idx = 0
-        self.draw_waypoints(self.waypoints)
 
-        
-        return self.get_observation(), {}
-    
-    
-
-    # def get_observation(self):
-    #     while self.rgb_image is None or self.seg_image is None:
-    #         time.sleep(0.001)
-    #         # self.world_.tick()
-        
-    #     with self.image_lock:
-    #         if self.rgb_image is None or self.seg_image is None:
-    #             raise RuntimeError("Image not found! Either seg or rgb!")
-            
-    #         image_obs = pre_process(self.rgb_image.copy(), self.seg_image.copy(), transform = None, device="cuda" if torch.cuda.is_available() else "cpu").cpu().numpy()
-            
-    #     velocity = self.vehicle_.get_velocity()
-    #     speed = np.linalg.norm([velocity.x, velocity.y, velocity.z])
-
-    #     control = self.vehicle_.get_control()
-    #     steering = control.steer
-    #     throttle = control.throttle
-    #     brake = control.brake
-
-    #     current_location = self.vehicle_.get_location()
-    #     if self.current_waypoint_idx < len(self.waypoints):
-    #         wp = self.waypoints[self.current_waypoint_idx]
-    #         distance = current_location.distance(wp.transform.location)
-    #         forward_vec = wp.transform.get_forward_vector()
-    #         vehicle_vec = self.vehicle_.get_transform().get_forward_vector()
-    #         angle = np.arccos(np.clip(np.dot([forward_vec.x, forward_vec.y], [vehicle_vec.x, vehicle_vec.y]), -1.0, 1.0))
-    #     else:
-    #         distance, angle = 0.0, 0.0
-
-    #     state_obs = np.array([speed, steering, throttle, brake, distance, angle], dtype=np.float32)
-    #     state_obs = np.clip(
-    #         state_obs,
-    #         a_min=[0.0, -1.0, 0.0, 0.0, 0.0, -np.pi],
-    #         a_max=[100.0, 1.0, 1.0, 1.0, 100.0, np.pi]
-    #     )
-
-    #     return {"image": image_obs.astype(np.uint8), "state": state_obs}
-    
-
-    def get_observation(self, timeout=2.0):
-        start_time = time.time()
-        while True:
-            with self.image_lock:
-                rgb_ready = self.rgb_image is not None
-                seg_ready = self.seg_image is not None
-            if rgb_ready and seg_ready:
-                break
-            if time.time() - start_time > timeout:
-                logging.warning("Sensor data timeout. Resetting environment.")
-                self.reset()  # Or raise an exception to trigger a full reset in your RL loop
-                # Optionally, return a blank observation or last valid one
-                return self.get_observation(timeout)
-            time.sleep(0.005)
-
-        with self.image_lock:
-            rgb = self.rgb_image.copy()
-            seg = self.seg_image.copy()
-
-        image_obs = pre_process(rgb, seg, transform=None, device="cuda" if torch.cuda.is_available() else "cpu").cpu().numpy()
-
-        velocity = self.vehicle_.get_velocity()
-        speed = np.linalg.norm([velocity.x, velocity.y, velocity.z])
-        control = self.vehicle_.get_control()
-        steering = control.steer
-        throttle = control.throttle
-        brake = control.brake
-
-        current_location = self.vehicle_.get_location()
-        if self.current_waypoint_idx < len(self.waypoints):
-            wp = self.waypoints[self.current_waypoint_idx]
-            distance = current_location.distance(wp.transform.location)
-            forward_vec = wp.transform.get_forward_vector()
-            vehicle_vec = self.vehicle_.get_transform().get_forward_vector()
-            angle = np.arccos(np.clip(np.dot([forward_vec.x, forward_vec.y], [vehicle_vec.x, vehicle_vec.y]), -1.0, 1.0))
-        else:
-            distance, angle = 0.0, 0.0
-
-        state_obs = np.array([speed, steering, throttle, brake, distance, angle], dtype=np.float32)
-        state_obs = np.clip(
-            state_obs,
-            a_min=[0.0, -1.0, 0.0, 0.0, 0.0, -np.pi],
-            a_max=[100.0, 1.0, 1.0, 1.0, 100.0, np.pi]
-        )
-
-        return {"image": image_obs.astype(np.uint8), "state": state_obs}
-
- 
-
-    # def step(self, action):
-
-    #     ##DEBUG
-    #     start_time = time.time()
-
-    #     # print(action)
-        
-    #     # if self.lane_invasion:
-    #     #     print("Lane Invaded")
-    #     # if self.collision:
-    #     #     print("collided")
-
-    #     steer_, throttle_, brake_  = action
-
-    #     # brake_ = 1.0 if brake_ > 0.65 else 0.0
-    #     # brake = max(min(brake_, 1.0), 0.0)
-        
-    #     self.vehicle_.apply_control(carla.VehicleControl(
-    #         throttle = float(throttle_),
-    #         # throttle = 1.0,
-    #         steer = float(steer_),
-    #         # brake = 0, 
-    #         brake = 1.0 if brake_ > 0.8 else 0, 
-    #         hand_brake=False
-    #     ))
-        
-    #     # self.world_.tick()
-     
-        
-    #     obs = self.get_observation()
-    #     reward = self.compute_reward()
-    #     self.episode_step += 1
-        
-    #     done = (
-    #         self.collision or
-    #         self.lane_invasion or    
-    #         self.episode_step >= self.max_steps or
-    #         self.current_waypoint_idx >= len(self.waypoints) - 1
-    #     )
-        
-    #     truncated = self.episode_step >= self.max_steps
-        
-          
-    #     # if self.client_.get_world().get_settings().synchronous_mode:
-    #     #     combined_image = np.hstack((self.seg_image, self.rgb_image))
-    #     #     cv2.imshow(f"Camera_Port_{self.client_.get_world().get_settings().port}", combined_image)
-    #     #     cv2.waitKey(1)
-        
-    #     # step_time = self.episode_step >= self.max_steps
-    #     # step_time = time.time() - start_time
-    #     # logger.info(f"Step time: {step_time:.3f}s")
-    #     logging.info(f"RGB callbacks: {self.rgb_count}, Seg callbacks: {self.seg_count}")
-    #     return obs, reward, done or truncated, truncated, {}
-    
-
-
-    def step(self, action):
-        start_time = time.time()
-
-        steer_, throttle_, brake_ = action
-
-        self.vehicle_.apply_control(carla.VehicleControl(
-            throttle = float(throttle_),
-            steer = float(steer_),
-            brake = 1.0 if brake_ > 0.8 else 0.0,
-            hand_brake=False
-        ))
+        self.previous_location = self.vehicle_.get_location()
 
         obs = self.get_observation()
-        reward = self.compute_reward()
+        return obs, {}
+
+    
+    def _spawn(self, bp, tf, attach_to=None):
+        actor = self.world_.spawn_actor(bp, tf, attach_to=attach_to)
+        self._actors.append(actor)
+        return actor
+    
+    def get_observation(self, timeout=2.0):
+        t0 = time.time()
+        while True:
+            try:
+                rgb_rgb, bgr_raw = self._tick_and_get_frame(timeout=timeout)
+                break
+            except Exception:
+                if time.time() - t0 > timeout:
+                    raise TimeoutError("Sensor timeout")
+                continue
+
+        seg = process_frame(bgr_raw)
+
+        img = pre_process(rgb_rgb, seg)  # (5,128,128) float32 in [0,1]
+
+        # State features
+        vel = self.vehicle_.get_velocity()
+        speed = float(np.linalg.norm([vel.x, vel.y, vel.z]))  # m/s
+
+        ctrl = self.vehicle_.get_control()
+        brake = 1.0 if ctrl.brake >= 0.5 else 0.0
+        throttle_eff = 0.0 if brake == 1.0 else max(0.4, float(ctrl.throttle))
+        steering = float(ctrl.steer)
+
+        loc = self.vehicle_.get_location()
+        if self.current_waypoint_idx < len(self.waypoints):
+            wp = self.waypoints[self.current_waypoint_idx]
+            dist = float(loc.distance(wp.transform.location))
+            ang = self._signed_angle_2d(wp.transform.get_forward_vector(),
+                                        self.vehicle_.get_transform().get_forward_vector())
+        else:
+            dist, ang = 0.0, 0.0
+
+    
+        state = np.array([speed, steering, throttle_eff, brake, dist, ang], dtype=np.float32)
+        state = np.clip(
+            state,
+            a_min=np.array([0.0, -1.0, 0.0, 0.0, 0.0, -np.pi], dtype=np.float32),
+            a_max=np.array([60.0,  1.0, 1.0, 1.0, 100.0,  np.pi], dtype=np.float32),
+        )
+        return {"image": img, "state": state}
+
+    def step(self, action):
         self.episode_step += 1
 
-        # Check if stuck for too long
-        current_time = self.world_.get_snapshot().timestamp.elapsed_seconds
-        velocity = self.vehicle_.get_velocity()
-        speed = np.linalg.norm([velocity.x, velocity.y, velocity.z])
+        a = np.asarray(action, dtype=np.float32)
+        steer_gate = float(np.clip(a[0], -1.0, 1.0))
+        thr_gate   = float(np.clip(a[1],  0.0, 1.0))
+        brk_gate   = float(np.clip(a[2],  0.0, 1.0))
 
-        stuck_duration_threshold = 2.0  # seconds
-        if not hasattr(self, 'stuck_start_time'):
-            self.stuck_start_time = current_time
+        # binary brake
+        brake = 1.0 if brk_gate > 0.7 else 0.0
+        # throttle rule
+        throttle = 0.0 if brake == 1.0 else (0.4 + (0.6 * thr_gate))
 
-        is_stuck_too_long = False
+        cmd = np.array([steer_gate, throttle, brake], dtype=np.float32)
+        cmd, _ = self._shield(None, cmd)
+
+        # re-enforce invariants after shield
+        brake    = 1.0 if cmd[2] >= 0.7 else 0.0
+        throttle = 0.0 if brake == 1.0 else max(0.4, float(cmd[1]))
+        steer    = float(np.clip(cmd[0], -1.0, 1.0))
+
+        vc = carla.VehicleControl(throttle=throttle, steer=steer, brake=brake, hand_brake=False)
+        self.vehicle_.apply_control(vc)
+
+        # Observe
+        obs = self.get_observation()
+
+        # Stuck detection for termination only
+        now = self.world_.get_snapshot().timestamp.elapsed_seconds
+        vel = self.vehicle_.get_velocity()
+        speed = float(np.linalg.norm([vel.x, vel.y, vel.z]))
+        if self.stuck_start_time is None:
+            self.stuck_start_time = now
+        stuck = False
         if speed < 0.2:
-            if (current_time - self.stuck_start_time) > stuck_duration_threshold:
-                is_stuck_too_long = True
+            if (now - self.stuck_start_time) > 2.0:
+                stuck = True
         else:
-            self.stuck_start_time = current_time
+            self.stuck_start_time = now
 
-        done = (
-            self.collision or
-            # self.lane_invasion or    
-            self.episode_step >= self.max_steps or
-            self.current_waypoint_idx >= len(self.waypoints) - 1 or
-            is_stuck_too_long
-        )
+        reward = self.compute_reward()
 
-        truncated = self.episode_step >= self.max_steps
+        terminated = bool(self.collision or self.current_waypoint_idx >= len(self.waypoints) - 1 or stuck)
+        truncated  = bool(self.episode_step >= self.max_steps)
 
-        # logging.info(f"RGB callbacks: {self.rgb_count}, Seg callbacks: {self.seg_count}")
-        
-        return obs, reward, done, truncated, {}
+        return obs, reward, terminated, truncated, {}
 
-
-
-
-    # def compute_reward(self):
-    #     reward = 0
-        
-    #     current_location = self.vehicle_.get_location()
-    #     control = self.vehicle_.get_control()
-    #     current_time = self.world_.get_snapshot().timestamp.elapsed_seconds
-        
-    #     stuck_duration_threshold = 2.0  # 2 seconds
-            
-    #     while self.current_waypoint_idx < len(self.waypoints) - 1:
-    #         wp = self.waypoints[self.current_waypoint_idx]
-    #         if current_location.distance(wp.transform.location) < 2.0:
-    #             self.current_waypoint_idx += 1
-    #             reward += 10.0
-    #         else:
-    #             break
-                
-    #     if self.collision:
-    #         reward -= 100.0
-    #     if self.lane_invasion:
-    #         reward -= 100.0
-        
-    #     map_ = self.world_.get_map()
-    #     wp = map_.get_waypoint(current_location)
-        
-    #     if self.current_waypoint_idx < len(self.waypoints):
-    #         current_wp = self.waypoints[self.current_waypoint_idx]
-    #         prev_dist = self.previous_location.distance(current_wp.transform.location)
-    #         curr_dist = current_location.distance(current_wp.transform.location)
-    #         reward += max(prev_dist - curr_dist, 0) * 0.1
-    #     self.previous_location = current_location
-        
-    #     velocity = self.vehicle_.get_velocity()
-    #     speed = np.linalg.norm([velocity.x, velocity.y, velocity.z])
-    #     reward += speed * 0.1
-
-    #     steer_change = abs(control.steer - self.prev_steer)
-    #     reward -= steer_change * 0.5
-    #     self.prev_steer = control.steer
-
-    #     reward -= 0.1
-        
-    #     if not hasattr(self, 'stuck_start_time'):
-    #         self.stuck_start_time = current_time
-    #         self.is_stuck = False
-        
-    #     if speed < 0.2 and control.throttle > 0.3 and control.brake < 0.1:
-    #         if not self.is_stuck:
-    #             self.is_stuck = True
-    #             self.stuck_start_time = current_time
-    #         elif current_time - self.stuck_start_time > stuck_duration_threshold:
-    #             reward -= 100.0  # Penalty for being stuck
-    #             self.is_stuck = False
-    #             self.stuck_start_time = current_time
-    #             # print(f"Stuck detected! Duration: {current_time - self.stuck_start_time:.2f}s, Speed: {speed:.2f}, Throttle: {control.throttle:.2f}")
-    #     else:
-    #         self.is_stuck = False
-    #         self.stuck_start_time = current_time
-        
-    #     steer_lock_threshold = 0.8
-    #     steer_lock_duration_threshold = 4.0  # seconds
-
-    #     if abs(control.steer) > steer_lock_threshold:
-    #         reward -= 1.0
-    #         if not self.is_steer_locked:
-    #             self.is_steer_locked = True
-    #             self.steer_lock_start_time = current_time
-    #         elif current_time - self.steer_lock_start_time > steer_lock_duration_threshold:
-    #             reward -= 50.0 
-    #             self.is_steer_locked = False
-    #             self.steer_lock_start_time = current_time 
-    #     else:
-    #         self.is_steer_locked = False
-    #         self.steer_lock_start_time = current_time
-
-
-    #     if speed < 0.2:
-    #         reward -= 100.0
-
-
-    #     # reward = np.clip(reward, -100, 50.0)
-        
-    #     return reward
 
     def compute_reward(self):
-        reward = 0
+        r = 0.0
+        loc = self.vehicle_.get_location()
+        ctrl = self.vehicle_.get_control()
 
-        current_location = self.vehicle_.get_location()
-        control = self.vehicle_.get_control()
-        current_time = self.world_.get_snapshot().timestamp.elapsed_seconds
+        vel = self.vehicle_.get_velocity()
+        speed = float(np.linalg.norm([vel.x, vel.y, vel.z]))
 
-        # --- Parameters ---
-        stuck_duration_threshold = 2.0  # seconds
-        steer_lock_threshold = 0.8
-        steer_lock_duration_threshold = 4.0  # seconds
-        min_speed_threshold = 1.0  #
-
-        # --- Waypoint Progress Reward ---
+        # #### Waypoint progress
         while self.current_waypoint_idx < len(self.waypoints) - 1:
             wp = self.waypoints[self.current_waypoint_idx]
-            if current_location.distance(wp.transform.location) < 2.0:
+            if loc.distance(wp.transform.location) < 2.0:
                 self.current_waypoint_idx += 1
-                reward += 10.0
+                r += 10.0
             else:
                 break
 
-        # --- Collision and Lane Invasion Penalties ---
-        if self.collision:
-            reward -= 100.0
-        if self.lane_invasion:
-            reward -= 100.0
-
-        # --- Progress Towards Current Waypoint ---
+        # Progress toward current waypoint
         if self.current_waypoint_idx < len(self.waypoints):
-            current_wp = self.waypoints[self.current_waypoint_idx]
-            prev_dist = self.previous_location.distance(current_wp.transform.location)
-            curr_dist = current_location.distance(current_wp.transform.location)
-            delta_progress = prev_dist - curr_dist
-            if delta_progress > 0:
-                reward += delta_progress * 0.1
-        self.previous_location = current_location
+            wp = self.waypoints[self.current_waypoint_idx]
+            prev_dist = self.previous_location.distance(wp.transform.location)
+            curr_dist = loc.distance(wp.transform.location)
+            delta = prev_dist - curr_dist
+            if delta > 0:
+                r += 0.1 * float(delta)
+        self.previous_location = loc
 
-        # --- Speed and Direction ---
-        velocity = self.vehicle_.get_velocity()
-        speed = np.linalg.norm([velocity.x, velocity.y, velocity.z])
+        now = self.world_.get_snapshot().timestamp.elapsed_seconds
 
-        # Penalize slow speed (< 1.0 m/s)
-        if speed < min_speed_threshold:
-            reward -= 1.0
+        # brake dwell penalty when stationary
+        if ctrl.brake >= 0.5:
+            if self.brake_on_since is None:
+                self.brake_on_since = now
+            if speed < 0.2:
+                r -= 0.5 * (now - self.brake_on_since)
         else:
-            reward += speed * 0.1  
+            self.brake_on_since = None
 
-        # --- Steering Stability ---
-        steer_change = abs(control.steer - self.prev_steer)
-        reward -= steer_change * 0.5
-        self.prev_steer = control.steer
-
-        # Penalize constant high steering (tight loop tricking)
-        if abs(control.steer) > steer_lock_threshold:
-            reward -= 1.0
-            if not self.is_steer_locked:
-                self.is_steer_locked = True
-                self.steer_lock_start_time = current_time
-            elif current_time - self.steer_lock_start_time > steer_lock_duration_threshold:
-                reward -= 50.0
-                self.is_steer_locked = False
-                self.steer_lock_start_time = current_time
+        # throttle-without-motion penalty
+        if ctrl.throttle >= 0.4 and speed < 0.2:
+            if self.no_move_since is None:
+                self.no_move_since = now
+            r -= 1.0 * (now - self.no_move_since)
         else:
-            self.is_steer_locked = False
-            self.steer_lock_start_time = current_time
+            self.no_move_since = None
 
-        # --- Stuck Detection ---
-        if not hasattr(self, 'stuck_start_time'):
-            self.stuck_start_time = current_time
-            self.is_stuck = False
-
-        if speed < 0.2 and control.throttle > 0.3 and control.brake < 0.1:
-            if not self.is_stuck:
-                self.is_stuck = True
-                self.stuck_start_time = current_time
-            elif current_time - self.stuck_start_time > stuck_duration_threshold:
-                reward -= 100.0  # Heavy penalty for stuck
-                self.is_stuck = False
-                self.stuck_start_time = current_time
+        # Speed shaping
+        if speed < 1.0:
+            r -= 1.0
         else:
-            self.is_stuck = False
-            self.stuck_start_time = current_time
+            r += 0.1 * speed
 
-        # --- Constant Small Penalty ---
-        reward -= 0.1
+        # Steering smoothness
+        r -= 0.5 * abs(ctrl.steer - self.prev_steer)
+        self.prev_steer = float(ctrl.steer)
 
-        # --- Clip final reward ---
-        reward = np.clip(reward, -100.0, 50.0)
+        # Lane invasion penalty (event-based, then clear)
+        if self.lane_invasion:
+            r -= 30.0
+            self.lane_invasion = False
 
-        # --- Rolling log of last 100 rewards ---
-        log_path = "rewards_log.txt"
+        # Collision penalty
+        if self.collision:
+            r -= 100.0
 
-        # Read existing entries
-        if os.path.exists(log_path):
-            with open(log_path, "r") as f:
-                lines = f.readlines()
-        else:
-            lines = []
+        # Small step penalty
+        r -= 0.1
 
-        # Prepend new reward (as a string)
-        lines.insert(0, f"{reward}\n")
-
-        # Keep only the most recent 100 entries
-        lines = lines[:100]
-
-        # Write back
-        with open(log_path, "w") as f:
-            f.writelines(lines)
-
-        # logging.info(f"Reward: {reward}")
-
-        return reward
+        return float(np.clip(r, -100.0, 50.0))
