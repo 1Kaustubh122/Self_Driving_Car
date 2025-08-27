@@ -7,9 +7,18 @@ import numpy as np
 import scipy.special
 from PIL import Image
 from ultralytics import YOLO
-sys.path.append('/home/kaustubh/Documents/GitHub/Self_Driving_Car/Imitation_Learning_RL')
-sys.path.append('/home/kaustubh/Documents/GitHub/Self_Driving_Car/Imitation_Learning_RL/model')
-sys.path.append('/home/kaustubh/Documents/GitHub/Self_Driving_Car/Imitation_Learning_RL/model')
+
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+ROOT_DIR_ = os.path.abspath(os.path.join(os.path.dirname(__file__)))
+if ROOT_DIR not in sys.path:
+    sys.path.insert(0, ROOT_DIR)
+
+if ROOT_DIR_ not in sys.path:
+    sys.path.insert(0, ROOT_DIR_)
+    
+# sys.path.append('/home/kaustubh/Documents/GitHub/Self_Driving_Car/Imitation_Learning_RL')
+# sys.path.append('/home/kaustubh/Documents/GitHub/Self_Driving_Car/Imitation_Learning_RL/model')
+# sys.path.append('/home/kaustubh/Documents/GitHub/Self_Driving_Car/Imitation_Learning_RL/model')
 from model.model import parsingNet
 from torchvision import transforms
 from ultralytics.utils import LOGGER
