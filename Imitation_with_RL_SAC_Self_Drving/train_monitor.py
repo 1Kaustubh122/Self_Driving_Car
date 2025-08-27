@@ -26,7 +26,7 @@ def check_carla_servers():
     return True
 
 def start_training():
-    return subprocess.Popen([sys.executable, "train.py"])
+    return subprocess.Popen([sys.executable, "train_multi.py"])
 
 def kill_training(proc):
     if proc is not None:
