@@ -1,153 +1,153 @@
-import re
+#!/usr/bin/env python3
 import os
-import sys
+import re
 import glob
-import platform
-
-if platform.system() == "Windows":
-    sys.path.append('C:/Users/WORKSTATION2/Self_Driving_Car/')
-    sys.path.append('C:/Users/WORKSTATION2/Self_Driving_Car/Imitation_Learning_RL/')
-    sys.path.append('C:/Users/WORKSTATION2/Self_Driving_Car/Imitation_Learning_RL/model')
-else: # Ubunutu
-    sys.path.append('/home/user/Self_Driving_Car/')
-    sys.path.append('/home/user/Self_Driving_Car/Imitation_Learning_RL/')
-    sys.path.append('/home/user/Self_Driving_Car/Imitation_Learning_RL/model')
-
+import sys
 import gc
+import argparse
 import torch
-import multiprocessing as mp
+
+# # for local imports 
+THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+if THIS_DIR not in sys.path:
+    sys.path.insert(0, THIS_DIR)
+
 from stable_baselines3 import SAC
-from carla_gym_env import CarlaEnv
 from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.common.vec_env import DummyVecEnv
-from stable_baselines3.common.vec_env import SubprocVecEnv
-from stable_baselines3.common.callbacks import EvalCallback
-from custom_feature_extractor import UnifiedFeatureExtractor
 from stable_baselines3.common.callbacks import CheckpointCallback, CallbackList, BaseCallback
-
-CHECKPOINTS_DIR = "checkpoints"
-TENSORBOARD_LOGS = "tensorboard_logs"
-CHECKPOINT_PATH = os.path.join(CHECKPOINTS_DIR, "sac_carla_model")
-TOTAL_TIMESTEPS = 5_000_000
-SAVE_INTERVAL = 10000
-DEVICE = "cuda" if torch.cuda.is_available() else 'cpu'
-
-def make_env(host, port):
-    def _init():
-        env = CarlaEnv(host=host, port=port)
-        env.reset()
-        env = Monitor(env)
-        return env
-    return _init
-
-
-pc_ip = "192.168.0.2"
-# env_fns = [make_env(pc_ip, 2000 + i) for i in range(0, 19, 3)]
-env_fns = [make_env(pc_ip, port) for port in [2000, 2003, 2006, 2009]]
-# env_fns = [make_env(pc_ip, port) for port in [2000,2003, 2006, 2009]]
+from carla_gym_env import CarlaEnv
+from custom_feature_extractor import UnifiedFeatureExtractor
 
 
 class TorchGCCallback(BaseCallback):
-    def __init__(self, verbose=0):
+    def __init__(self, interval_steps: int = 100, verbose: int = 0):
         super().__init__(verbose)
-    
+        self._interval = max(1, int(interval_steps))
+
     def _on_step(self) -> bool:
-        if self.n_calls % 100 == 0:
-            torch.cuda.empty_cache()
+        if self.n_calls % self._interval == 0:
             gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         return True
-    
-def find_latest_checkpoint(checkpoints_dir, prefix="sac_carla_model"):
-    """Find the checkpoint with the highest number of steps."""
-    checkpoint_files = glob.glob(os.path.join(checkpoints_dir, f"{prefix}_*steps.zip"))
-    if not checkpoint_files:
+
+
+def find_latest_checkpoint(checkpoints_dir: str, prefix: str = "sac_carla_model"):
+    pattern = os.path.join(checkpoints_dir, f"{prefix}_*steps.zip")
+    files = glob.glob(pattern)
+    if not files:
         return None
 
-    def extract_steps(path):
-        match = re.search(rf"{prefix}_(\d+)_steps\.zip", os.path.basename(path))
-        return int(match.group(1)) if match else -1
+    def _steps(p):
+        m = re.search(rf"{re.escape(prefix)}_(\d+)_steps\.zip$", os.path.basename(p))
+        return int(m.group(1)) if m else -1
 
-    checkpoint_files = sorted(checkpoint_files, key=extract_steps)
-    return checkpoint_files[-1] 
+    files.sort(key=_steps)
+    return files[-1]
+
+
+def make_env(host: str, port: int):
+    env = CarlaEnv(host=host, port=port)
+    env = Monitor(env)
+    return env
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="SAC training on single CARLA env")
+    p.add_argument("--host", type=str, default="127.0.0.1")
+    p.add_argument("--port", type=int, default=2000)
+    p.add_argument("--total-steps", type=int, default=5_000_000)
+    p.add_argument("--checkpoint-dir", type=str, default="checkpoints")
+    p.add_argument("--tb-log-dir", type=str, default="tensorboard_logs")
+    p.add_argument("--checkpoint-prefix", type=str, default="sac_carla_model")
+    p.add_argument("--save-freq", type=int, default=10_000)  # env steps
+    p.add_argument("--resume", action="store_true", help="resume from latest checkpoint if present")
+    p.add_argument("--device", type=str, default=("cuda" if torch.cuda.is_available() else "cpu"))
+    p.add_argument("--gc-interval", type=int, default=100)
+    # SAC core hyperparams 
+    p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--buffer-size", type=int, default=200_000)
+    p.add_argument("--learning-starts", type=int, default=5_000)
+    p.add_argument("--batch-size", type=int, default=128)
+    p.add_argument("--tau", type=float, default=0.005)
+    p.add_argument("--gamma", type=float, default=0.99)
+    p.add_argument("--train-freq", type=int, default=1)
+    p.add_argument("--gradient-steps", type=int, default=1)
+    return p.parse_args()
+
 
 def main():
+    args = parse_args()
 
-    
-    os.makedirs(CHECKPOINTS_DIR, exist_ok=True)
-    os.makedirs(TENSORBOARD_LOGS, exist_ok=True)
-    
-    # try:
-    #     env=SubprocVecEnv(env_fns)
-    # except Exception as e:
-    #     print(f"Failed to create multi-envs: {e}")
-    #     env=DummyVecEnv([make_env("localhost", 2000)])
+    os.makedirs(args.checkpoint_dir, exist_ok=True)
+    os.makedirs(args.tb_log_dir, exist_ok=True)
 
-    env=SubprocVecEnv(env_fns)
-    # env=DummyVecEnv([make_env("localhost", 2000)])
+    # Single environment
+    env = make_env(args.host, args.port)
 
-    # env=DummyVecEnv(env_fns)
-
-    # print(env.observation_space)
-
-    
     policy_kwargs = {
-        'features_extractor_class' : UnifiedFeatureExtractor,
-
-        'features_extractor_kwargs' : {
-            "features_dim" : 768
-        },
-  
-        # 'net_arch' : dict(pi=[768, 256, 256], qf=[768, 256, 256])
-        # 'net_arch' : dict(pi=[512, 256], qf=[512, 256])
-        # 'net_arch' : dict(pi=[256, 128], qf=[256, 128])
-        'net_arch' : dict(pi=[128, 64], qf=[128, 64])
-        
+        "features_extractor_class": UnifiedFeatureExtractor,
+        "features_extractor_kwargs": {"features_dim": 768},
+        "net_arch": dict(pi=[128, 64], qf=[128, 64]),
     }
-    
-    latest_checkpoint = find_latest_checkpoint(CHECKPOINTS_DIR) 
-    # latest_checkpoint = 'checkpoints\sac_carla_model_117200_steps.zip'
 
-    
-    if latest_checkpoint:
-        model = SAC.load(latest_checkpoint, env=env, device=DEVICE)
-        print(f"Resuming training from checkpoint: {latest_checkpoint}")
+    device = args.device
+
+    latest = find_latest_checkpoint(args.checkpoint_dir, args.checkpoint_prefix) if args.resume else None
+    if latest:
+        print(f"[resume] Loading checkpoint: {latest}")
+        model = SAC.load(latest, env=env, device=device)
     else:
-        print("Starting new training.")
-        
+        print("[new] Starting fresh training")
         model = SAC(
-            "MultiInputPolicy",
-            env,
+            policy="MultiInputPolicy",
+            env=env,
             policy_kwargs=policy_kwargs,
-            learning_rate=3e-4,
-            buffer_size=1000,
-            learning_starts=5000,
-            batch_size=128,
-            tau=0.005,
-            gamma=0.99,
-            train_freq=1,
-            gradient_steps=1,
-            tensorboard_log=TENSORBOARD_LOGS,
+            learning_rate=args.lr,
+            buffer_size=args.buffer_size,
+            learning_starts=args.learning_starts,
+            batch_size=args.batch_size,
+            tau=args.tau,
+            gamma=args.gamma,
+            train_freq=args.train_freq,
+            gradient_steps=args.gradient_steps,
+            tensorboard_log=args.tb_log_dir,
             verbose=1,
-            device=DEVICE
+            device=device,
         )
-    
-    checkpoint_callback = CheckpointCallback(save_freq=100, save_path=CHECKPOINTS_DIR, name_prefix='sac_carla_model')
-    callbacks = CallbackList([checkpoint_callback, TorchGCCallback()])
-    timesteps_done = model.num_timesteps
-    remaining_timesteps = TOTAL_TIMESTEPS - timesteps_done
 
-    print(f"Already trained: {timesteps_done} steps. Remaining: {remaining_timesteps} steps.")
+    # Callbacks
+    checkpoint_cb = CheckpointCallback(
+        save_freq=args.save_freq,
+        save_path=args.checkpoint_dir,
+        name_prefix=args.checkpoint_prefix,
+        save_replay_buffer=False,
+        save_vecnormalize=False,
+    )
+    gc_cb = TorchGCCallback(interval_steps=args.gc_interval)
+    callbacks = CallbackList([checkpoint_cb, gc_cb])
 
-    model.learn(total_timesteps=remaining_timesteps, callback=callbacks, progress_bar=True, reset_num_timesteps=False)
+    # Compute remaining timesteps if resuming
+    already = int(getattr(model, "num_timesteps", 0))
+    remaining = max(0, int(args.total_steps) - already)
+    print(f"[info] steps_done={already} remaining={remaining}")
 
-    gc.collect()  
-    torch.cuda.empty_cache()
-    model.save("sac_carla_model")
-    
-    final_model_path = os.path.join(CHECKPOINTS_DIR, f"sac_final_{TOTAL_TIMESTEPS//1000}k")
-    model.save(final_model_path)
-    print(f"[DONE] Final model saved to: {final_model_path}")
+    if remaining > 0:
+        model.learn(
+            total_timesteps=remaining,
+            callback=callbacks,
+            progress_bar=True,
+            reset_num_timesteps=False,
+        )
+    else:
+        print("[info] nothing to do, already at or beyond target steps")
+
+    # Save final
+    final_stem = f"{args.checkpoint_prefix}_final_{args.total_steps // 1000}k"
+    final_path = os.path.join(args.checkpoint_dir, final_stem)
+    model.save(final_path)
+    print(f"[done] Saved final model to: {final_path}")
+
 
 if __name__ == "__main__":
-    mp.set_start_method("spawn", force=True)
     main()
