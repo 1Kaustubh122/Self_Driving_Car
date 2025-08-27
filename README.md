@@ -36,4 +36,14 @@ Expert data includes:
 # Clone repo
 git clone https://github.com/1Kaustubh122/Self_Driving_Car
 cd Self_Driving_Car
+cd Self_Driving_Car/Imitation_with_RL_SAC_Self_Drving
+
+## for single env
+python train.py
+
+## for multi env
+python train_multi.py
+
+## Carla core dumped safe training run: (Only for windows OS)
+start_monitor.bat
 
